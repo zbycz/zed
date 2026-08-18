@@ -5701,10 +5701,6 @@ mod tests {
         let workspace_window = cx.add_window(|window, cx| {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
         });
-        let workspace = workspace_window
-            .read_with(cx, |multi, _| multi.workspace().clone())
-            .expect("workspace should exist");
-
         let (weak_workspace, async_window_cx) = workspace_window
             .update(cx, |multi, window, cx| {
                 (multi.workspace().downgrade(), window.to_async(cx))
