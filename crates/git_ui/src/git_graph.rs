@@ -604,16 +604,17 @@ pub struct OpenAtCommit {
     pub sha: String,
 }
 
-/// Parses the branch filter modal's input: one ref per line, with blank lines
-/// and duplicates dropped.
+/// Parses the branch filter modal's input. Refs are written one per line, but
+/// any whitespace separates them, and a trailing comma is tolerated so that a
+/// pasted tab label like `main, origin/main` works too. Duplicates are dropped.
 fn parse_branch_filter_input(input: &str) -> Vec<SharedString> {
     let mut branches: Vec<SharedString> = Vec::new();
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for token in input.split_whitespace() {
+        let token = token.trim_end_matches(',');
+        if token.is_empty() {
             continue;
         }
-        let branch = SharedString::from(line.to_string());
+        let branch = SharedString::from(token.to_string());
         if !branches.contains(&branch) {
             branches.push(branch);
         }
@@ -682,6 +683,9 @@ impl Render for BranchFilterModal {
             .elevation_3(cx)
             .key_context("GitGraphBranchFilter")
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.confirm(window, cx);
+            }))
             .child(
                 Modal::new("git-graph-branch-filter", None)
                     .header(
@@ -7623,13 +7627,16 @@ mod tests {
 
     #[test]
     fn test_parse_branch_filter_input() {
+        let expected = vec![
+            SharedString::from("main"),
+            SharedString::from("origin/main"),
+        ];
         assert_eq!(
             parse_branch_filter_input("main\n  origin/main  \n\nmain\n"),
-            vec![
-                SharedString::from("main"),
-                SharedString::from("origin/main")
-            ]
+            expected
         );
+        // A pasted tab label parses back into the same refs.
+        assert_eq!(parse_branch_filter_input("main, origin/main"), expected);
         assert!(parse_branch_filter_input("   \n\n").is_empty());
     }
 

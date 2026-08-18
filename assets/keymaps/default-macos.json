@@ -1154,6 +1154,15 @@
     },
   },
   {
+    "context": "GitGraphBranchFilter > Editor && mode == auto_height",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "editor::Newline",
+      "cmd-enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "GitCommit > Editor && mode == auto_height",
     "use_key_equivalents": true,
     "bindings": {
