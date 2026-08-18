@@ -1,0 +1,54 @@
+# Fork-local macOS bundling. The upstream `run_bundling` workflow is gated on
+# `github.repository_owner == 'zed-industries'` and targets Namespace runners,
+# so it never runs here.
+name: fork_bundle_mac
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+    - claude/**
+permissions:
+  contents: read
+concurrency:
+  group: fork_bundle_mac-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle_mac_aarch64:
+    name: Zed-aarch64.dmg
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      CARGO_INCREMENTAL: '0'
+      # GitHub-hosted macOS runners give us 3 cores and ~14 GB of disk, which a
+      # stock Zed release build overruns. Dropping debug info and LTO keeps the
+      # job inside both limits; the resulting app is a little slower.
+      CARGO_PROFILE_RELEASE_DEBUG: none
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+    - name: Reclaim runner disk space
+      run: |
+        selected="$(xcode-select -p | sed 's|/Contents/Developer$||')"
+        for app in /Applications/Xcode*.app; do
+          if [ "$app" != "$selected" ]; then
+            sudo rm -rf "$app"
+          fi
+        done
+        sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/*
+        df -h /
+    - name: ./script/bundle-mac
+      run: ./script/bundle-mac aarch64-apple-darwin
+    - name: Report disk usage
+      if: always()
+      run: df -h /
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Zed-aarch64.dmg
+        path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+        if-no-files-found: error
