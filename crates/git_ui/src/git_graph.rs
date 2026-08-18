@@ -2528,7 +2528,7 @@ impl GitGraph {
         };
 
         h_flex()
-            .flex_1()
+            .flex_shrink_1()
             .min_w_0()
             .gap_0p5()
             .overflow_x_hidden()
@@ -2881,8 +2881,7 @@ impl GitGraph {
                 h_flex()
                     .h_7()
                     .w_64()
-                    .flex_shrink_0()
-                    .min_w_0()
+                    .flex_none()
                     .px_1p5()
                     .gap_1()
                     .track_focus(&query_focus_handle)
@@ -2916,9 +2915,10 @@ impl GitGraph {
                             })
                     }),
             )
+            .child(div().flex_1())
             .child(
                 h_flex()
-                    .min_w_64()
+                    .flex_none()
                     .gap_1()
                     .child({
                         let focus_handle = self.focus_handle.clone();
