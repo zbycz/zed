@@ -1059,17 +1059,14 @@ pub fn init(cx: &mut App) {
             div.when_some(
                 resolve_file_history_target(workspace, window, cx),
                 |div, (repo_id, log_source)| {
-                    let git_store = workspace.project().read(cx).git_store().clone();
                     let workspace = workspace.weak_handle();
 
                     div.on_action(move |_: &git::FileHistory, window, cx| {
-                        let git_store = git_store.clone();
                         workspace
                             .update(cx, |workspace, cx| {
                                 open_or_reuse_graph(
                                     workspace,
                                     repo_id,
-                                    git_store,
                                     log_source.clone(),
                                     None,
                                     window,
@@ -1097,12 +1094,9 @@ pub fn init(cx: &mut App) {
                                     };
                                     let selected_repo_id = repo.read(cx).id;
 
-                                    let git_store =
-                                        workspace.project().read(cx).git_store().clone();
                                     open_or_reuse_graph(
                                         workspace,
                                         selected_repo_id,
-                                        git_store,
                                         LogSource::All,
                                         None,
                                         window,
@@ -1122,11 +1116,9 @@ pub fn init(cx: &mut App) {
                                 };
                                 let selected_repo_id = repo.read(cx).id;
 
-                                let git_store = workspace.project().read(cx).git_store().clone();
                                 open_or_reuse_graph(
                                     workspace,
                                     selected_repo_id,
-                                    git_store,
                                     LogSource::All,
                                     Some(sha),
                                     window,
@@ -1196,7 +1188,6 @@ fn resolve_file_history_target(
 pub fn open_or_reuse_graph(
     workspace: &mut Workspace,
     repo_id: RepositoryId,
-    _git_store: Entity<GitStore>,
     log_source: LogSource,
     sha: Option<String>,
     window: &mut Window,
@@ -6788,27 +6779,11 @@ mod tests {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
         });
         let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
-        let git_graph = cx.new_window_entity(|window, cx| {
-            GitGraph::new(
-                repository.read(cx).id,
-                project.read(cx).git_store().clone(),
-                workspace.downgrade(),
-                None,
-                window,
-                cx,
-            )
-        });
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
-        });
-        cx.run_until_parked();
-
-        git_graph.update(cx, |graph, cx| {
-            graph.select_commit_by_sha(first_sha, cx);
-        });
-        cx.run_until_parked();
-        git_graph.update(cx, |graph, cx| {
-            graph.select_commit_by_sha(second_sha, cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let git_store = project.read(cx).git_store().clone();
+            let panel = cx.new(|cx| GitGraphPanel::new(workspace.weak_handle(), git_store, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
         });
         cx.run_until_parked();
 
@@ -6816,7 +6791,24 @@ mod tests {
             open_or_reuse_graph(
                 workspace,
                 repository.read(cx).id,
-                project.read(cx).git_store().clone(),
+                LogSource::All,
+                Some(second_sha.to_string()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let git_graph = panel.read_with(&*cx, |panel, _| {
+            panel
+                .graph()
+                .expect("opening the graph populates the panel")
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_or_reuse_graph(
+                workspace,
+                repository.read(cx).id,
                 LogSource::All,
                 Some(first_sha.to_string()),
                 window,
@@ -6825,6 +6817,13 @@ mod tests {
         });
         cx.run_until_parked();
 
+        panel.read_with(&*cx, |panel, _| {
+            assert_eq!(
+                panel.graph().map(|graph| graph.entity_id()),
+                Some(git_graph.entity_id()),
+                "reopening the same log should reuse the loaded graph"
+            );
+        });
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.selected_entry_idx, Some(1));
         });

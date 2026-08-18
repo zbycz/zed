@@ -92,10 +92,7 @@ pub fn init(cx: &mut App) {
             else {
                 return;
             };
-            let git_store = workspace.project().read(cx).git_store().clone();
-            git_graph::open_or_reuse_graph(
-                workspace, repo_id, git_store, log_source, None, window, cx,
-            );
+            git_graph::open_or_reuse_graph(workspace, repo_id, log_source, None, window, cx);
         },
         cx,
     );

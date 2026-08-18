@@ -51,7 +51,7 @@ impl GitGraphPanel {
         })
     }
 
-    fn new(
+    pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         git_store: Entity<GitStore>,
         cx: &mut Context<Self>,
@@ -94,13 +94,22 @@ impl GitGraphPanel {
             return graph.clone();
         }
 
-        let git_store = self.git_store.clone();
-        let workspace = self.workspace.clone();
-        let graph =
-            cx.new(|cx| GitGraph::new(repo_id, git_store, workspace, Some(log_source), window, cx));
+        let graph = self.build_graph(repo_id, log_source, window, cx);
         self.graph = Some(graph.clone());
         cx.notify();
         graph
+    }
+
+    fn build_graph(
+        &self,
+        repo_id: RepositoryId,
+        log_source: LogSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<GitGraph> {
+        let git_store = self.git_store.clone();
+        let workspace = self.workspace.clone();
+        cx.new(|cx| GitGraph::new(repo_id, git_store, workspace, Some(log_source), window, cx))
     }
 
     /// A strip identifying the log being shown, rendered only for file
@@ -147,12 +156,16 @@ impl GitGraphPanel {
         )
     }
 
+    pub fn graph(&self) -> Option<Entity<GitGraph>> {
+        self.graph.clone()
+    }
+
     fn active_repo_id(&self, cx: &App) -> Option<RepositoryId> {
         Some(self.git_store.read(cx).active_repository()?.read(cx).id)
     }
 
     /// Makes sure a graph is present, defaulting to the whole history of the
-    /// active repository.
+    /// active repository. Called from `render`, so it must not notify.
     fn ensure_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.graph.is_some() {
             return;
@@ -160,7 +173,7 @@ impl GitGraphPanel {
         let Some(repo_id) = self.active_repo_id(cx) else {
             return;
         };
-        self.show_graph(repo_id, LogSource::All, window, cx);
+        self.graph = Some(self.build_graph(repo_id, LogSource::All, window, cx));
     }
 }
 
