@@ -62,6 +62,8 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
+use crate::git_graph_panel::GitGraphPanel;
+
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
 const LANE_WIDTH: Pixels = px(16.0);
@@ -1189,38 +1191,24 @@ fn resolve_file_history_target(
     Some((repo.read(cx).id, LogSource::Path(repo_path)))
 }
 
+/// Reveals the git graph in its dock panel, replacing whatever log it was
+/// showing before.
 pub fn open_or_reuse_graph(
     workspace: &mut Workspace,
     repo_id: RepositoryId,
-    git_store: Entity<GitStore>,
+    _git_store: Entity<GitStore>,
     log_source: LogSource,
     sha: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
-        let graph = graph.read(cx);
-        graph.repo_id == repo_id && graph.log_source == log_source
-    });
-
-    let git_graph = if let Some(existing) = existing {
-        workspace.activate_item(&existing, true, true, window, cx);
-        existing
-    } else {
-        let workspace_handle = workspace.weak_handle();
-        let git_graph = cx.new(|cx| {
-            GitGraph::new(
-                repo_id,
-                git_store,
-                workspace_handle,
-                Some(log_source),
-                window,
-                cx,
-            )
-        });
-        workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
-        git_graph
+    let Some(panel) = workspace.focus_panel::<GitGraphPanel>(window, cx) else {
+        return;
     };
+
+    let git_graph = panel.update(cx, |panel, cx| {
+        panel.show_graph(repo_id, log_source, window, cx)
+    });
 
     if let Some(sha) = sha {
         cx.defer(move |cx| {
@@ -1334,6 +1322,14 @@ pub struct GitGraph {
 }
 
 impl GitGraph {
+    pub fn repo_id(&self) -> RepositoryId {
+        self.repo_id
+    }
+
+    pub fn log_source(&self) -> &LogSource {
+        &self.log_source
+    }
+
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_data.clear();
         self.search_state.matches.clear();
