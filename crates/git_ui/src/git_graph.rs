@@ -73,6 +73,8 @@ const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
+/// Line height of a commit row, as a multiple of the row font size.
+const ROW_LINE_HEIGHT: f32 = 1.35;
 
 struct CopiedState {
     copied_at: Option<Instant>,
@@ -1348,13 +1350,23 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
-    fn row_height(window: &Window, _cx: &App) -> Pixels {
-        let rem_size = window.rem_size();
-        let line_height = window.text_style().line_height_in_pixels(rem_size);
-        let raw = line_height + ROW_VERTICAL_PADDING;
+    fn row_height(window: &Window, cx: &App) -> Pixels {
+        let raw = Self::row_line_height(window, cx) + ROW_VERTICAL_PADDING;
         let scale = window.scale_factor();
 
         (raw * scale).round() / scale
+    }
+
+    /// The line height every row of the graph renders its text with. The graph
+    /// uses a smaller font than the rest of the UI to fit more commits on
+    /// screen, so it cannot rely on the window's default text style.
+    fn row_line_height(window: &Window, cx: &App) -> Pixels {
+        let font_size = Self::row_font_size(cx).to_pixels(window.rem_size());
+        (font_size * ROW_LINE_HEIGHT).round()
+    }
+
+    fn row_font_size(cx: &App) -> Rems {
+        TextSize::Small.rems(cx)
     }
 
     fn visible_row_count(&self, window: &Window, cx: &App) -> usize {
@@ -1484,10 +1496,10 @@ impl GitGraph {
                 RedistributableColumnsState::new(
                     4,
                     vec![
-                        DefiniteLength::Fraction(0.72),
+                        DefiniteLength::Fraction(0.68),
+                        DefiniteLength::Fraction(0.13),
                         DefiniteLength::Fraction(0.12),
-                        DefiniteLength::Fraction(0.1),
-                        DefiniteLength::Fraction(0.06),
+                        DefiniteLength::Fraction(0.07),
                     ],
                     vec![
                         TableResizeBehavior::Resizable,
@@ -1502,11 +1514,11 @@ impl GitGraph {
                 RedistributableColumnsState::new(
                     5,
                     vec![
-                        DefiniteLength::Fraction(0.14),
-                        DefiniteLength::Fraction(0.6192),
-                        DefiniteLength::Fraction(0.1032),
-                        DefiniteLength::Fraction(0.086),
-                        DefiniteLength::Fraction(0.0516),
+                        DefiniteLength::Fraction(0.09),
+                        DefiniteLength::Fraction(0.59),
+                        DefiniteLength::Fraction(0.13),
+                        DefiniteLength::Fraction(0.12),
+                        DefiniteLength::Fraction(0.07),
                     ],
                     vec![
                         TableResizeBehavior::Resizable,
@@ -1716,9 +1728,11 @@ impl GitGraph {
         name: &SharedString,
         accent_color: gpui::Hsla,
         is_head: bool,
+        height: Option<Pixels>,
     ) -> impl IntoElement {
         Chip::new(name.clone())
             .label_size(LabelSize::Small)
+            .when_some(height, |chip, height| chip.height(height))
             .truncate()
             .tooltip({
                 let name = name.clone();
@@ -1746,9 +1760,10 @@ impl GitGraph {
         accent_color: gpui::Hsla,
         is_head: bool,
         commit_idx: usize,
+        height: Option<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chip = self.render_chip(name, accent_color, is_head);
+        let chip = self.render_chip(name, accent_color, is_head, height);
         let Some(ref_name) = Self::ref_name_from_decoration(name) else {
             return chip.into_any_element();
         };
@@ -1788,6 +1803,7 @@ impl GitGraph {
         });
 
         let row_height = Self::row_height(window, cx);
+        let chip_height = Self::row_line_height(window, cx);
 
         // We fetch data outside the visible viewport to avoid loading entries when
         // users scroll through the git graph
@@ -1848,6 +1864,7 @@ impl GitGraph {
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
                 let column_label = |label: SharedString| {
                     Label::new(label)
+                        .size(LabelSize::Small)
                         .when(!is_selected, |c| c.color(Color::Muted))
                         .truncate()
                         .into_any_element()
@@ -1884,6 +1901,7 @@ impl GitGraph {
                         })
                         .unwrap_or_default();
                     HighlightedLabel::from_ranges(subject, highlight_ranges)
+                        .size(LabelSize::Small)
                         .when(!is_selected, |c| c.color(Color::Muted))
                         .truncate()
                         .into_any_element()
@@ -1897,7 +1915,7 @@ impl GitGraph {
                         .overflow_hidden()
                         .child(
                             h_flex()
-                                .gap_2()
+                                .gap_1p5()
                                 .overflow_hidden()
                                 .children((!commit.data.ref_names.is_empty()).then(|| {
                                     h_flex().gap_1().children(commit.data.ref_names.iter().map(
@@ -1909,6 +1927,7 @@ impl GitGraph {
                                                 accent_color,
                                                 is_head,
                                                 idx,
+                                                Some(chip_height),
                                                 cx,
                                             )
                                         },
@@ -2551,13 +2570,13 @@ impl GitGraph {
             .tab_group()
             .tab_stop(false)
             .w_full()
-            .p_1p5()
-            .gap_1p5()
+            .p_1()
+            .gap_1()
             .border_b_1()
             .border_color(color.border_variant)
             .child(
                 h_flex()
-                    .h_8()
+                    .h_7()
                     .flex_1()
                     .min_w_0()
                     .px_1p5()
@@ -2872,7 +2891,14 @@ impl GitGraph {
                         h_flex().gap_1().flex_wrap().justify_center().children(
                             ref_names.iter().map(|name| {
                                 let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                self.render_ref_chip(name, accent_color, is_head, selected_idx, cx)
+                                self.render_ref_chip(
+                                    name,
+                                    accent_color,
+                                    is_head,
+                                    selected_idx,
+                                    None,
+                                    cx,
+                                )
                             }),
                         )
                     }))
@@ -3809,19 +3835,24 @@ impl Render for GitGraph {
                                             vec![
                                                 Label::new("Graph")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .truncate()
                                                     .into_any_element(),
                                                 Label::new("Description")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Date")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Author")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Commit")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                             ],
                                             5,
@@ -3831,15 +3862,19 @@ impl Render for GitGraph {
                                             vec![
                                                 Label::new("Description")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Date")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Author")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                                 Label::new("Commit")
                                                     .color(Color::Muted)
+                                                    .size(LabelSize::Small)
                                                     .into_any_element(),
                                             ],
                                             4,
@@ -4049,6 +4084,8 @@ impl Render for GitGraph {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .text_size(Self::row_font_size(cx))
+            .line_height(Self::row_line_height(window, cx))
             .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
                 this.open_selected_commit_view(window, cx);
             }))
