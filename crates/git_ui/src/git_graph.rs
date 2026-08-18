@@ -1899,14 +1899,28 @@ impl GitGraph {
                 vec![
                     div()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
+                        .w_full()
                         .overflow_hidden()
                         .child(
                             h_flex()
+                                .w_full()
                                 .gap_1p5()
                                 .overflow_hidden()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .child(subject_label),
+                                )
                                 .children((!commit.data.ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
-                                        |name| {
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .max_w_1_2()
+                                        .gap_1()
+                                        .justify_end()
+                                        .overflow_hidden()
+                                        .children(commit.data.ref_names.iter().map(|name| {
                                             let is_head =
                                                 Self::is_head_ref(name.as_ref(), &head_branch_name);
                                             self.render_ref_chip(
@@ -1917,10 +1931,8 @@ impl GitGraph {
                                                 Some(chip_height),
                                                 cx,
                                             )
-                                        },
-                                    ))
-                                }))
-                                .child(subject_label),
+                                        }))
+                                })),
                         )
                         .into_any_element(),
                     column_label(formatted_time.into()),
