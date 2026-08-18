@@ -4,7 +4,7 @@ use gpui::{
     Subscription, WeakEntity, Window, actions, px,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
-use ui::prelude::*;
+use ui::{IconButton, IconSize, Tooltip, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -103,6 +103,50 @@ impl GitGraphPanel {
         graph
     }
 
+    /// A strip identifying the log being shown, rendered only for file
+    /// history since the full log needs no explanation.
+    fn render_path_history_header(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let graph = self.graph.as_ref()?;
+        let LogSource::Path(path) = graph.read(cx).log_source().clone() else {
+            return None;
+        };
+        let repo_id = graph.read(cx).repo_id();
+
+        Some(
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Icon::new(IconName::FileGit)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new("History").size(LabelSize::Small))
+                .child(
+                    Label::new(path.as_unix_str().to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .child(
+                    IconButton::new("git-graph-show-full-log", IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .shape(ui::IconButtonShape::Square)
+                        .tooltip(|_, cx| Tooltip::simple("Show All Commits", cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.show_graph(repo_id, LogSource::All, window, cx);
+                        })),
+                ),
+        )
+    }
+
     fn active_repo_id(&self, cx: &App) -> Option<RepositoryId> {
         Some(self.git_store.read(cx).active_repository()?.read(cx).id)
     }
@@ -137,8 +181,9 @@ impl Render for GitGraphPanel {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .children(self.render_path_history_header(cx))
             .map(|this| match self.graph.as_ref() {
-                Some(graph) => this.child(graph.clone()),
+                Some(graph) => this.child(div().flex_1().min_h_0().child(graph.clone())),
                 None => this.justify_center().items_center().child(
                     Label::new("No repository found")
                         .size(LabelSize::Small)
