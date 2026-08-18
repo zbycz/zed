@@ -5721,12 +5721,18 @@ mod tests {
             .expect("git panel should load");
         cx.background_executor.forbid_parking();
 
-        workspace_window
+        let graph_panel = workspace_window
             .update(cx, |multi, window, cx| {
                 let workspace = multi.workspace();
                 workspace.update(cx, |workspace, cx| {
                     workspace.add_panel(git_panel.clone(), window, cx);
-                });
+
+                    let git_store = project.read(cx).git_store().clone();
+                    let graph_panel =
+                        cx.new(|cx| GitGraphPanel::new(workspace.weak_handle(), git_store, cx));
+                    workspace.add_panel(graph_panel.clone(), window, cx);
+                    graph_panel
+                })
             })
             .expect("workspace window should be available");
         cx.executor().advance_clock(Duration::from_millis(100));
@@ -5750,13 +5756,15 @@ mod tests {
             .expect("workspace window should be available");
         cx.run_until_parked();
 
-        workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 1);
+        let tracked1_graph = graph_panel.read_with(cx, |panel, cx| {
+            let graph = panel
+                .graph()
+                .expect("file history should populate the panel");
             assert_eq!(
-                graphs[0].read(cx).log_source,
+                graph.read(cx).log_source,
                 LogSource::Path(tracked1_repo_path.clone())
             );
+            graph
         });
 
         workspace_window
@@ -5777,11 +5785,17 @@ mod tests {
             .expect("workspace window should be available");
         cx.run_until_parked();
 
-        workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 1);
+        graph_panel.read_with(cx, |panel, cx| {
+            let graph = panel
+                .graph()
+                .expect("file history should populate the panel");
             assert_eq!(
-                graphs[0].read(cx).log_source,
+                graph.entity_id(),
+                tracked1_graph.entity_id(),
+                "the same file history should reuse the loaded graph"
+            );
+            assert_eq!(
+                graph.read(cx).log_source,
                 LogSource::Path(tracked1_repo_path.clone())
             );
         });
@@ -5853,15 +5867,17 @@ mod tests {
             .expect("workspace window should be available");
         cx.run_until_parked();
 
-        workspace.read_with(cx, |workspace, cx| {
-            let graphs = workspace.items_of_type::<GitGraph>(cx).collect::<Vec<_>>();
-            assert_eq!(graphs.len(), 2);
-            let latest = graphs
-                .into_iter()
-                .max_by_key(|graph| graph.entity_id())
-                .expect("expected a git graph");
+        graph_panel.read_with(cx, |panel, cx| {
+            let graph = panel
+                .graph()
+                .expect("file history should populate the panel");
+            assert_ne!(
+                graph.entity_id(),
+                tracked1_graph.entity_id(),
+                "a different file history should replace the graph"
+            );
             assert_eq!(
-                latest.read(cx).log_source,
+                graph.read(cx).log_source,
                 LogSource::Path(tracked2_repo_path)
             );
         });
