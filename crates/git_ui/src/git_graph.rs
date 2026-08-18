@@ -50,11 +50,12 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
-    RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, Modal,
+    ModalFooter, ModalHeader, RedistributableColumnsState, ScrollableHandle, Section, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -601,6 +602,125 @@ actions!(
 #[action(namespace = git_graph)]
 pub struct OpenAtCommit {
     pub sha: String,
+}
+
+/// Parses the branch filter modal's input: one ref per line, with blank lines
+/// and duplicates dropped.
+fn parse_branch_filter_input(input: &str) -> Vec<SharedString> {
+    let mut branches: Vec<SharedString> = Vec::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let branch = SharedString::from(line.to_string());
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    branches
+}
+
+fn branch_filter_label(branches: &[SharedString]) -> SharedString {
+    branches
+        .iter()
+        .map(|branch| branch.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ")
+        .into()
+}
+
+/// Modal that collects the refs a branch filter tab should show, one per line.
+struct BranchFilterModal {
+    editor: Entity<Editor>,
+    git_graph: WeakEntity<GitGraph>,
+}
+
+impl BranchFilterModal {
+    fn new(git_graph: WeakEntity<GitGraph>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(4, 12, window, cx);
+            editor.set_placeholder_text("main\norigin/main\nv1.2.3", window, cx);
+            editor
+        });
+        editor.focus_handle(cx).focus(window, cx);
+        Self { editor, git_graph }
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let branches = parse_branch_filter_input(&self.editor.read(cx).text(cx));
+        if branches.is_empty() {
+            self.editor.focus_handle(cx).focus(window, cx);
+            return;
+        }
+        self.git_graph
+            .update(cx, |git_graph, cx| {
+                git_graph.add_branch_filter(branches, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for BranchFilterModal {}
+impl ModalView for BranchFilterModal {}
+
+impl Focusable for BranchFilterModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for BranchFilterModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(rems(30.))
+            .elevation_3(cx)
+            .key_context("GitGraphBranchFilter")
+            .on_action(cx.listener(Self::cancel))
+            .child(
+                Modal::new("git-graph-branch-filter", None)
+                    .header(
+                        ModalHeader::new()
+                            .headline("Filter Log by Branches")
+                            .description("One ref per line: branches, remote branches or tags."),
+                    )
+                    .section(
+                        Section::new().child(
+                            div()
+                                .w_full()
+                                .p_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .bg(cx.theme().colors().editor_background)
+                                .child(self.editor.clone()),
+                        ),
+                    )
+                    .footer(
+                        ModalFooter::new().end_slot(
+                            h_flex()
+                                .gap_1()
+                                .child(Button::new("branch-filter-cancel", "Cancel").on_click(
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.emit(DismissEvent);
+                                    }),
+                                ))
+                                .child(
+                                    Button::new("branch-filter-confirm", "Show Log")
+                                        .style(ButtonStyle::Filled)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm(window, cx);
+                                        })),
+                                ),
+                        ),
+                    ),
+            )
+    }
 }
 
 fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
@@ -1310,6 +1430,10 @@ pub struct GitGraph {
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    /// The log source the "All" branch filter tab restores.
+    default_log_source: LogSource,
+    branch_filters: Vec<Vec<SharedString>>,
+    active_branch_filter: Option<usize>,
 }
 
 impl GitGraph {
@@ -1542,6 +1666,11 @@ impl GitGraph {
         })
         .detach();
 
+        let (branch_filters, active_branch_filter, default_log_source) = match &log_source {
+            LogSource::Branches(branches) => (vec![branches.clone()], Some(0), LogSource::All),
+            source => (Vec::new(), None, source.clone()),
+        };
+
         let mut this = GitGraph {
             focus_handle,
             git_store,
@@ -1574,6 +1703,9 @@ impl GitGraph {
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            default_log_source,
+            branch_filters,
+            active_branch_filter,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -2298,6 +2430,176 @@ impl GitGraph {
         self.select_commit_by_sha(oid, cx);
     }
 
+    fn set_log_source(&mut self, log_source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == log_source {
+            return;
+        }
+
+        self.log_source = log_source;
+        self.selected_entry_idx = None;
+        self.hovered_entry_idx = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_diff_stats = None;
+        self.selected_commit_message = None;
+        self._selected_commit_message_task = None;
+        self._commit_diff_task = None;
+        self.changed_files_expanded_dirs.clear();
+        self.pending_select_sha = None;
+        self.table_interaction_state.update(cx, |state, cx| {
+            state.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        });
+        self.invalidate_state(cx);
+    }
+
+    /// Switches to the branch filter tab at `filter_idx`, or back to the
+    /// unfiltered log when it is `None`.
+    fn activate_branch_filter(&mut self, filter_idx: Option<usize>, cx: &mut Context<Self>) {
+        let filter_idx = filter_idx.filter(|idx| *idx < self.branch_filters.len());
+        let log_source = match filter_idx.and_then(|idx| self.branch_filters.get(idx)) {
+            Some(branches) => LogSource::Branches(branches.clone()),
+            None => self.default_log_source.clone(),
+        };
+
+        self.active_branch_filter = filter_idx;
+        self.set_log_source(log_source, cx);
+        cx.notify();
+    }
+
+    fn add_branch_filter(&mut self, branches: Vec<SharedString>, cx: &mut Context<Self>) {
+        if branches.is_empty() {
+            return;
+        }
+
+        let filter_idx = self
+            .branch_filters
+            .iter()
+            .position(|existing| *existing == branches)
+            .unwrap_or_else(|| {
+                self.branch_filters.push(branches);
+                self.branch_filters.len() - 1
+            });
+
+        self.activate_branch_filter(Some(filter_idx), cx);
+    }
+
+    fn remove_branch_filter(&mut self, filter_idx: usize, cx: &mut Context<Self>) {
+        if filter_idx >= self.branch_filters.len() {
+            return;
+        }
+
+        self.branch_filters.remove(filter_idx);
+
+        match self.active_branch_filter {
+            Some(active) if active == filter_idx => self.activate_branch_filter(None, cx),
+            Some(active) if active > filter_idx => {
+                self.active_branch_filter = Some(active - 1);
+                cx.notify();
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    fn deploy_branch_filter_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let git_graph = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    BranchFilterModal::new(git_graph, window, cx)
+                });
+            })
+            .ok();
+    }
+
+    /// Renders the branch filter tabs shown to the left of the search field.
+    /// The first tab is the unfiltered log; every other tab restricts the log
+    /// to the refs the user entered in the branch filter modal.
+    fn render_branch_filter_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let all_tab_label = match &self.default_log_source {
+            LogSource::Path(path) => SharedString::from(format!(
+                "History: {}",
+                path.as_ref()
+                    .file_name()
+                    .unwrap_or_else(|| path.as_unix_str())
+            )),
+            LogSource::Branch(branch) => branch.clone(),
+            LogSource::Sha(sha) => SharedString::from(sha.display_short()),
+            LogSource::All | LogSource::Branches(_) => SharedString::from("All"),
+        };
+
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_0p5()
+            .overflow_x_hidden()
+            .child(
+                Button::new("git-graph-branch-filter-all", all_tab_label)
+                    .label_size(LabelSize::Small)
+                    .toggle_state(self.active_branch_filter.is_none())
+                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.activate_branch_filter(None, cx);
+                    })),
+            )
+            .children(
+                self.branch_filters
+                    .iter()
+                    .enumerate()
+                    .map(|(filter_idx, branches)| {
+                        let is_active = self.active_branch_filter == Some(filter_idx);
+                        let label = branch_filter_label(branches);
+
+                        h_flex()
+                            .gap_0p5()
+                            .child(
+                                Button::new(
+                                    ElementId::NamedInteger(
+                                        "git-graph-branch-filter".into(),
+                                        filter_idx as u64,
+                                    ),
+                                    label.clone(),
+                                )
+                                .label_size(LabelSize::Small)
+                                .truncate(true)
+                                .toggle_state(is_active)
+                                .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .tooltip(move |_, cx| Tooltip::simple(label.clone(), cx))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.activate_branch_filter(Some(filter_idx), cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ElementId::NamedInteger(
+                                        "git-graph-branch-filter-close".into(),
+                                        filter_idx as u64,
+                                    ),
+                                    IconName::Close,
+                                )
+                                .shape(ui::IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(|_, cx| Tooltip::simple("Remove Filter", cx))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.remove_branch_filter(filter_idx, cx);
+                                    },
+                                )),
+                            )
+                    }),
+            )
+            .child(
+                IconButton::new("git-graph-branch-filter-add", IconName::Plus)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| Tooltip::simple("Filter Log by Branches", cx))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.deploy_branch_filter_modal(window, cx);
+                    })),
+            )
+    }
+
     pub fn set_repo_id(&mut self, repo_id: RepositoryId, cx: &mut Context<Self>) {
         if repo_id != self.repo_id
             && self
@@ -2555,7 +2857,8 @@ impl GitGraph {
     }
 
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = cx.theme().colors();
+        let border_color = cx.theme().colors().border_variant;
+        let toolbar_background = cx.theme().colors().toolbar_background;
         let query_focus_handle = self
             .search_state
             .editor
@@ -2572,19 +2875,21 @@ impl GitGraph {
             .p_1()
             .gap_1()
             .border_b_1()
-            .border_color(color.border_variant)
+            .border_color(border_color)
+            .child(self.render_branch_filter_tabs(cx))
             .child(
                 h_flex()
                     .h_7()
-                    .flex_1()
+                    .w_64()
+                    .flex_shrink_0()
                     .min_w_0()
                     .px_1p5()
                     .gap_1()
                     .track_focus(&query_focus_handle)
                     .border_1()
-                    .border_color(color.border_variant)
+                    .border_color(border_color)
                     .rounded_md()
-                    .bg(color.toolbar_background)
+                    .bg(toolbar_background)
                     .on_action(cx.listener(Self::confirm_search))
                     .child(self.search_state.editor.clone())
                     .child({
@@ -2963,7 +3268,9 @@ impl GitGraph {
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Label::new(author_name).size(LabelSize::Small).truncate())
+                                    .child(
+                                        Label::new(author_name).size(LabelSize::Small).truncate(),
+                                    )
                                     .child(
                                         Label::new(date_string)
                                             .size(LabelSize::Small)
@@ -4427,6 +4734,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_BRANCHES: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -4437,6 +4745,7 @@ mod persistence {
         match log_source {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
+            LogSource::Branches(_) => LOG_SOURCE_BRANCHES,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
@@ -4446,6 +4755,13 @@ mod persistence {
         match log_source {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
+            LogSource::Branches(branches) => Some(
+                branches
+                    .iter()
+                    .map(|branch| branch.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
         }
@@ -4467,6 +4783,12 @@ mod persistence {
                 .log_source_value
                 .as_ref()
                 .map(|v| LogSource::Branch(v.clone().into()))
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_BRANCHES) => state
+                .log_source_value
+                .as_ref()
+                .map(|value| LogSource::Branches(super::parse_branch_filter_input(value)))
+                .filter(|source| !matches!(source, LogSource::Branches(branches) if branches.is_empty()))
                 .unwrap_or_default(),
             Some(LOG_SOURCE_SHA) => state
                 .log_source_value
@@ -7297,6 +7619,81 @@ mod tests {
             Some("v1.0".into())
         );
         assert_eq!(GitGraph::ref_name_from_decoration("HEAD"), None);
+    }
+
+    #[test]
+    fn test_parse_branch_filter_input() {
+        assert_eq!(
+            parse_branch_filter_input("main\n  origin/main  \n\nmain\n"),
+            vec![
+                SharedString::from("main"),
+                SharedString::from("origin/main")
+            ]
+        );
+        assert!(parse_branch_filter_input("   \n\n").is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_tabs_switch_the_log_source(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            assert_eq!(graph.log_source, LogSource::All);
+            graph.add_branch_filter(vec!["main".into(), "origin/main".into()], cx);
+            assert_eq!(
+                graph.log_source,
+                LogSource::Branches(vec!["main".into(), "origin/main".into()])
+            );
+            assert_eq!(graph.active_branch_filter, Some(0));
+
+            // Re-adding the same set of refs reuses the existing tab.
+            graph.add_branch_filter(vec!["main".into(), "origin/main".into()], cx);
+            assert_eq!(graph.branch_filters.len(), 1);
+
+            graph.activate_branch_filter(None, cx);
+            assert_eq!(graph.log_source, LogSource::All);
+            assert_eq!(graph.active_branch_filter, None);
+
+            graph.activate_branch_filter(Some(0), cx);
+            graph.remove_branch_filter(0, cx);
+            assert!(graph.branch_filters.is_empty());
+            assert_eq!(graph.active_branch_filter, None);
+            assert_eq!(graph.log_source, LogSource::All);
+        });
     }
 
     #[gpui::test]
