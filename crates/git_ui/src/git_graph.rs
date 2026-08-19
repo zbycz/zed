@@ -17,10 +17,10 @@ use git::{
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
     DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
-    px, uniform_list,
+    FontWeight, Hsla, ListSizingBehavior, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task,
+    TextStyleRefinement, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
+    point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
@@ -1402,8 +1402,10 @@ struct GitGraphContextMenu {
 
 struct DetailPanelCommitMessage {
     sha: Oid,
-    message: Entity<Markdown>,
-    scroll_handle: ScrollHandle,
+    /// The first line of the commit message, rendered as its own heading.
+    subject: SharedString,
+    /// Everything after the subject line, if the commit has a body.
+    body: Option<Entity<Markdown>>,
 }
 
 pub struct GitGraph {
@@ -1431,6 +1433,9 @@ pub struct GitGraph {
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
+    /// Scrolls the commit detail panel as a whole, so the commit message and
+    /// the changed files move together instead of scrolling independently.
+    commit_details_scroll_handle: ScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
@@ -1704,6 +1709,7 @@ impl GitGraph {
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
+            commit_details_scroll_handle: ScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
@@ -2161,6 +2167,8 @@ impl GitGraph {
         self.changed_files_view_mode = self.changed_files_view_mode.toggled();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        self.commit_details_scroll_handle
+            .set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -2290,6 +2298,8 @@ impl GitGraph {
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        self.commit_details_scroll_handle
+            .set_offset(point(px(0.), px(0.)));
         self.table_interaction_state.update(cx, |state, cx| {
             state.scroll_handle.scroll_to_item(idx, scroll_strategy);
             cx.notify();
@@ -2381,11 +2391,17 @@ impl GitGraph {
                 workspace.project().read(cx).languages().clone()
             })
             .log_err();
-        self.selected_commit_message = Some(DetailPanelCommitMessage {
-            sha,
-            message: cx.new(|cx| Markdown::new(message, languages, None, cx)),
-            scroll_handle: ScrollHandle::new(),
+        let (subject, body) = match message.split_once('\n') {
+            Some((subject, body)) => (subject.trim_end(), body.trim_start_matches('\n')),
+            None => (message.as_ref(), ""),
+        };
+        let subject = SharedString::from(subject.to_string());
+        let body = (!body.trim().is_empty()).then(|| {
+            let body = SharedString::from(body.to_string());
+            cx.new(|cx| Markdown::new(body, languages, None, cx))
         });
+
+        self.selected_commit_message = Some(DetailPanelCommitMessage { sha, subject, body });
         self._selected_commit_message_task = None;
         cx.notify();
     }
@@ -3150,6 +3166,8 @@ impl GitGraph {
                 this.changed_files_view_mode = this.changed_files_view_mode.toggled();
                 this.changed_files_scroll_handle
                     .scroll_to_item(0, ScrollStrategy::Top);
+                this.commit_details_scroll_handle
+                    .set_offset(point(px(0.), px(0.)));
                 cx.notify();
             }));
 
@@ -3259,7 +3277,17 @@ impl GitGraph {
                 self.commit_details_split_state.read(cx).right_ratio(),
             ))
             .child(
-                v_flex()
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .id("commit-details")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.commit_details_scroll_handle)
+                            .child(                v_flex()
                     .w_full()
                     .p_2()
                     .gap_1p5()
@@ -3340,16 +3368,13 @@ impl GitGraph {
                             .flex_wrap()
                             .child(sha_button)
                             .children(email_button),
-                    ),
-            )
-            .child(Divider::horizontal())
-            .child(self.render_commit_message(window, cx))
-            .child(Divider::horizontal())
-            .child(
-                v_flex()
+                    ),)
+                            .child(Divider::horizontal())
+                            .child(self.render_commit_message(window, cx))
+                            .child(Divider::horizontal())
+                            .child(                v_flex()
                     .min_w_0()
-                    .flex_1()
-                    .overflow_hidden()
+                    .w_full()
                     .child(
                         h_flex()
                             .p_2()
@@ -3386,8 +3411,7 @@ impl GitGraph {
                     .child(
                         div()
                             .id("changed-files-container")
-                            .flex_1()
-                            .min_h_0()
+                            .w_full()
                             .child({
                                 let flat_entries = changed_file_entries;
 
@@ -3471,11 +3495,13 @@ impl GitGraph {
                                         ),
                                     )
                                 })
-                                .size_full()
+                                .w_full()
+                                .with_sizing_behavior(ListSizingBehavior::Infer)
                                 .track_scroll(&self.changed_files_scroll_handle)
-                            })
-                            .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
-                    ),
+                            }),
+                    )),
+                    )
+                    .vertical_scrollbar_for(&self.commit_details_scroll_handle, window, cx),
             )
             .into_any_element()
     }
@@ -3972,20 +3998,13 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let Some(DetailPanelCommitMessage {
-            message,
-            scroll_handle,
-            ..
-        }) = self.selected_commit_message.as_ref()
+        let Some(DetailPanelCommitMessage { subject, body, .. }) =
+            self.selected_commit_message.as_ref()
         else {
             return Empty.into_any_element();
         };
 
         let message_style = editor::hover_markdown_style(window, cx);
-        let rem_size = window.rem_size();
-        let line_height = message_style
-            .base_text_style
-            .line_height_in_pixels(rem_size);
 
         div()
             // Using grid over flexbox because the structure of this side
@@ -4000,21 +4019,17 @@ impl GitGraph {
             .grid_cols(1)
             .gap_1()
             .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .child(
-                        div()
-                            .id("commit-message")
-                            .text_sm()
-                            .w_full()
-                            .max_h(line_height * 12.)
-                            .overflow_y_scroll()
-                            .track_scroll(scroll_handle)
-                            .child(MarkdownElement::new(message.clone(), message_style)),
-                    )
-                    .vertical_scrollbar_for(scroll_handle, window, cx),
+                Label::new(subject.clone())
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::BOLD),
             )
+            .children(body.clone().map(|body| {
+                div()
+                    .id("commit-message")
+                    .text_sm()
+                    .w_full()
+                    .child(MarkdownElement::new(body, message_style))
+            }))
             .into_any_element()
     }
 }
@@ -7777,14 +7792,18 @@ mod tests {
                 .as_ref()
                 .expect("selected_commit_message should be Some");
             assert_eq!(message.sha, commit_sha);
-            let source = message.message.read_with(app, |m, _| m.source().to_owned());
-            assert!(source.contains("Fix crash"));
+            assert_eq!(message.subject, SharedString::from("Fix crash"));
+            let source = message
+                .body
+                .as_ref()
+                .expect("commit body should be Some")
+                .read_with(app, |m, _| m.source().to_owned());
             assert!(source.contains("This fixes a crash"));
         });
     }
 
     #[gpui::test]
-    async fn test_long_commit_message_is_constrained_to_scroll_viewport(cx: &mut TestAppContext) {
+    async fn test_long_commit_message_scrolls_with_the_whole_detail_panel(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -7876,40 +7895,29 @@ mod tests {
         );
         cx.run_until_parked();
 
-        let (message_scroll_handle, changed_files_scroll_handle) =
+        let (details_scroll_handle, changed_files_scroll_handle) =
             git_graph.read_with(&*cx, |graph, _| {
                 (
-                    graph
-                        .selected_commit_message
-                        .as_ref()
-                        .expect("selected commit message should be loaded")
-                        .scroll_handle
-                        .clone(),
+                    graph.commit_details_scroll_handle.clone(),
                     graph.changed_files_scroll_handle.clone(),
                 )
             });
-        let maximum_message_height = git_graph.update_in(cx, |_, window, cx| {
-            editor::hover_markdown_style(window, cx)
-                .base_text_style
-                .line_height_in_pixels(window.rem_size())
-                * 12.
-        });
-        let message_bounds = message_scroll_handle.bounds();
+        let details_bounds = details_scroll_handle.bounds();
         let changed_files_bounds = changed_files_scroll_handle.0.borrow().base_handle.bounds();
 
         assert!(
-            message_bounds.size.height <= maximum_message_height,
-            "commit message viewport height ({}) should not exceed its maximum ({})",
-            message_bounds.size.height,
-            maximum_message_height,
+            details_scroll_handle.max_offset().y > px(0.),
+            "a long commit message should make the whole detail panel scrollable"
         );
         assert!(
-            message_scroll_handle.max_offset().y > px(0.),
-            "long commit message should be scrollable"
+            changed_files_bounds.size.height > px(0.),
+            "the changed files list should be laid out at its full height inside the panel, \
+             so that scrolling the panel reveals it"
         );
         assert!(
-            message_bounds.bottom() <= changed_files_bounds.top(),
-            "commit message viewport {message_bounds:?} should not overlap changed files {changed_files_bounds:?}"
+            changed_files_bounds.top() >= details_bounds.top(),
+            "changed files {changed_files_bounds:?} should live inside the panel viewport \
+             {details_bounds:?}"
         );
     }
 
@@ -7985,7 +7993,8 @@ mod tests {
             graph
                 .selected_commit_message
                 .as_ref()
-                .map(|m| m.message.entity_id())
+                .and_then(|m| m.body.as_ref())
+                .map(|body| body.entity_id())
         });
         assert!(message_entity_id.is_some());
 
@@ -8000,7 +8009,8 @@ mod tests {
             let new_entity_id = graph
                 .selected_commit_message
                 .as_ref()
-                .map(|m| m.message.entity_id());
+                .and_then(|m| m.body.as_ref())
+                .map(|body| body.entity_id());
             assert_eq!(message_entity_id, new_entity_id);
         });
     }
