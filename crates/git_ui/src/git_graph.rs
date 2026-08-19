@@ -2881,6 +2881,7 @@ impl GitGraph {
             .border_b_1()
             .border_color(border_color)
             .child(self.render_branch_filter_tabs(cx))
+            .child(div().flex_1())
             .child(
                 h_flex()
                     .h_7()
@@ -2919,7 +2920,6 @@ impl GitGraph {
                             })
                     }),
             )
-            .child(div().flex_1())
             .child(
                 h_flex()
                     .flex_none()
