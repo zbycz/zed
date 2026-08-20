@@ -17,10 +17,9 @@ use git::{
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
     DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Hsla, ListSizingBehavior, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task,
-    TextStyleRefinement, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
-    point, prelude::*, px, uniform_list,
+    FontWeight, Hsla, ListAlignment, ListState, MouseButton, MouseDownEvent, PathBuilder, Pixels,
+    Point, ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
+    WeakEntity, Window, actions, anchored, deferred, list, point, prelude::*, px,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
@@ -50,12 +49,11 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, Modal,
-    ModalFooter, ModalHeader, RedistributableColumnsState, ScrollableHandle, Section, Table,
-    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
-    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
-    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
-    table_row::TableRow,
+    HeaderResizeInfo, HighlightedLabel, ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader,
+    RedistributableColumnsState, ScrollableHandle, Section, Table, TableInteractionState,
+    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
+    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
+    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -1432,10 +1430,11 @@ pub struct GitGraph {
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
-    changed_files_scroll_handle: UniformListScrollHandle,
-    /// Scrolls the commit detail panel as a whole, so the commit message and
-    /// the changed files move together instead of scrolling independently.
-    commit_details_scroll_handle: ScrollHandle,
+    /// Drives the commit detail panel: item 0 is the panel's header and the
+    /// remaining items are the changed file rows, so the panel scrolls as a
+    /// whole while the file rows stay virtualized.
+    commit_details_list_state: ListState,
+    commit_details_list_len: Cell<usize>,
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
@@ -1708,8 +1707,8 @@ impl GitGraph {
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
-            changed_files_scroll_handle: UniformListScrollHandle::new(),
-            commit_details_scroll_handle: ScrollHandle::new(),
+            commit_details_list_state: ListState::new(1, ListAlignment::Top, px(400.)),
+            commit_details_list_len: Cell::new(1),
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
@@ -2165,10 +2164,7 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         self.changed_files_view_mode = self.changed_files_view_mode.toggled();
-        self.changed_files_scroll_handle
-            .scroll_to_item(0, ScrollStrategy::Top);
-        self.commit_details_scroll_handle
-            .set_offset(point(px(0.), px(0.)));
+        self.reset_commit_details_list();
         cx.notify();
     }
 
@@ -2296,10 +2292,7 @@ impl GitGraph {
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.changed_files_expanded_dirs.clear();
-        self.changed_files_scroll_handle
-            .scroll_to_item(0, ScrollStrategy::Top);
-        self.commit_details_scroll_handle
-            .set_offset(point(px(0.), px(0.)));
+        self.reset_commit_details_list();
         self.table_interaction_state.update(cx, |state, cx| {
             state.scroll_handle.scroll_to_item(idx, scroll_strategy);
             cx.notify();
@@ -3048,6 +3041,155 @@ impl GitGraph {
             return Empty.into_any_element();
         };
 
+        let commit_sha: SharedString = commit_entry.data.sha.to_string().into();
+        let is_tree_view = self.changed_files_view_mode.is_tree();
+
+        let changed_file_entries: Rc<Vec<ChangedFileEntry>> = Rc::new(
+            self.selected_commit_diff
+                .as_ref()
+                .map(|diff| {
+                    let mut files = diff.files.iter().collect::<Vec<_>>();
+                    if !is_tree_view {
+                        files.sort_by_key(|file| file.status());
+                    }
+                    files
+                        .into_iter()
+                        .map(|file| ChangedFileEntry::from_commit_file(file, cx))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if is_tree_view {
+            Rc::new(build_changed_file_tree_entries(
+                changed_file_entries.as_ref().clone(),
+                &self.changed_files_expanded_dirs,
+            ))
+        } else {
+            Rc::default()
+        };
+
+        let file_count = if is_tree_view {
+            tree_entries.len()
+        } else {
+            changed_file_entries.len()
+        };
+        self.sync_commit_details_list_len(file_count + 1);
+
+        let repository = repository.downgrade();
+        let workspace = self.workspace.clone();
+        let git_graph = cx.weak_entity();
+
+        v_flex()
+            .min_w(px(300.))
+            .h_full()
+            .bg(cx.theme().colors().editor_background)
+            .flex_basis(DefiniteLength::Fraction(
+                self.commit_details_split_state.read(cx).right_ratio(),
+            ))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        list(
+                            self.commit_details_list_state.clone(),
+                            move |ix, window, cx| {
+                                let Some(file_ix) = ix.checked_sub(1) else {
+                                    return git_graph
+                                        .update(cx, |this, cx| {
+                                            this.render_commit_details_header(window, cx)
+                                        })
+                                        .unwrap_or_else(|_| Empty.into_any_element());
+                                };
+
+                                if is_tree_view {
+                                    match tree_entries.get(file_ix) {
+                                        Some(ChangedFileTreeEntry::Directory(entry)) => {
+                                            entry.render(file_ix, git_graph.clone(), cx)
+                                        }
+                                        Some(ChangedFileTreeEntry::File(entry)) => {
+                                            entry.entry.render(
+                                                file_ix,
+                                                entry.depth,
+                                                None,
+                                                commit_sha.clone(),
+                                                repository.clone(),
+                                                workspace.clone(),
+                                                cx,
+                                            )
+                                        }
+                                        None => Empty.into_any_element(),
+                                    }
+                                } else {
+                                    match changed_file_entries.get(file_ix) {
+                                        Some(entry) => {
+                                            let directory_label = (!entry.dir_path.is_empty())
+                                                .then(|| entry.dir_path.clone());
+                                            entry.render(
+                                                file_ix,
+                                                0,
+                                                directory_label,
+                                                commit_sha.clone(),
+                                                repository.clone(),
+                                                workspace.clone(),
+                                                cx,
+                                            )
+                                        }
+                                        None => Empty.into_any_element(),
+                                    }
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .vertical_scrollbar_for(&self.commit_details_list_state, window, cx),
+            )
+            .into_any_element()
+    }
+
+    /// Resizes the detail panel's list to `len` items without disturbing the
+    /// scroll position, so expanding a directory does not jump the panel.
+    fn sync_commit_details_list_len(&self, len: usize) {
+        let previous = self.commit_details_list_len.get();
+        if previous == len {
+            return;
+        }
+
+        let unchanged = previous.min(len);
+        self.commit_details_list_state
+            .splice(unchanged..previous, len - unchanged);
+        self.commit_details_list_len.set(len);
+    }
+
+    /// Scrolls the detail panel back to the top and drops the rows of the
+    /// previously selected commit.
+    fn reset_commit_details_list(&self) {
+        self.commit_details_list_state.reset(1);
+        self.commit_details_list_len.set(1);
+    }
+
+    /// Renders everything above the changed file rows: author, refs, commit
+    /// message and the changed files summary. It is item 0 of the detail
+    /// panel's list, so that the panel scrolls as a whole while the file rows
+    /// below it stay virtualized.
+    fn render_commit_details_header(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(selected_idx) = self.selected_entry_idx else {
+            return Empty.into_any_element();
+        };
+
+        let Some(commit_entry) = self.graph_data.commits.get(selected_idx) else {
+            return Empty.into_any_element();
+        };
+
+        let Some(repository) = self.get_repository(cx) else {
+            return Empty.into_any_element();
+        };
+
         let data = repository.update(cx, |repository, cx| {
             repository
                 .fetch_commit_data(commit_entry.data.sha, false, cx)
@@ -3125,31 +3267,6 @@ impl GitGraph {
         let (total_lines_added, total_lines_removed) =
             self.selected_commit_diff_stats.unwrap_or((0, 0));
 
-        let changed_file_entries: Vec<ChangedFileEntry> = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| {
-                let mut files = diff.files.iter().collect::<Vec<_>>();
-                if !self.changed_files_view_mode.is_tree() {
-                    files.sort_by_key(|file| file.status());
-                }
-                files
-                    .into_iter()
-                    .map(|file| ChangedFileEntry::from_commit_file(file, cx))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let changed_file_entries = Rc::new(changed_file_entries);
-        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if self.changed_files_view_mode.is_tree()
-        {
-            Rc::new(build_changed_file_tree_entries(
-                changed_file_entries.as_ref().clone(),
-                &self.changed_files_expanded_dirs,
-            ))
-        } else {
-            Rc::default()
-        };
-
         let is_tree_view = self.changed_files_view_mode.is_tree();
         let view_toggle = IconButton::new("toggle-changed-files-view", IconName::ListTree)
             .icon_size(IconSize::Small)
@@ -3164,10 +3281,7 @@ impl GitGraph {
             })
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.changed_files_view_mode = this.changed_files_view_mode.toggled();
-                this.changed_files_scroll_handle
-                    .scroll_to_item(0, ScrollStrategy::Top);
-                this.commit_details_scroll_handle
-                    .set_offset(point(px(0.), px(0.)));
+                this.reset_commit_details_list();
                 cx.notify();
             }));
 
@@ -3270,24 +3384,9 @@ impl GitGraph {
         });
 
         v_flex()
-            .min_w(px(300.))
-            .h_full()
-            .bg(cx.theme().colors().editor_background)
-            .flex_basis(DefiniteLength::Fraction(
-                self.commit_details_split_state.read(cx).right_ratio(),
-            ))
+            .w_full()
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        v_flex()
-                            .id("commit-details")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.commit_details_scroll_handle)
-                            .child(                v_flex()
+                v_flex()
                     .w_full()
                     .p_2()
                     .gap_1p5()
@@ -3368,140 +3467,45 @@ impl GitGraph {
                             .flex_wrap()
                             .child(sha_button)
                             .children(email_button),
-                    ),)
-                            .child(Divider::horizontal())
-                            .child(self.render_commit_message(window, cx))
-                            .child(Divider::horizontal())
-                            .child(                v_flex()
-                    .min_w_0()
-                    .w_full()
-                    .child(
-                        h_flex()
-                            .p_2()
-                            .pr_3()
-                            .pb_1()
-                            .gap_1()
-                            .w_full()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new(format!(
-                                            "{} Changed {}",
-                                            changed_files_count,
-                                            if changed_files_count == 1 {
-                                                "File"
-                                            } else {
-                                                "Files"
-                                            }
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    )
-                                    .child(Divider::vertical())
-                                    .child(view_toggle),
-                            )
-                            .child(DiffStat::new(
-                                "commit-diff-stat",
-                                total_lines_added,
-                                total_lines_removed,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("changed-files-container")
-                            .w_full()
-                            .child({
-                                let flat_entries = changed_file_entries;
-
-                                let entry_count = if is_tree_view {
-                                    tree_entries.len()
-                                } else {
-                                    flat_entries.len()
-                                };
-                                let commit_sha = full_sha.clone();
-                                let repository = repository.downgrade();
-                                let workspace = self.workspace.clone();
-                                let git_graph = cx.weak_entity();
-                                let indent_tree_entries = tree_entries.clone();
-
-                                uniform_list(
-                                    "changed-files-list",
-                                    entry_count,
-                                    move |range, _window, cx| {
-                                        range
-                                            .map(|ix| {
-                                                if is_tree_view {
-                                                    match &tree_entries[ix] {
-                                                        ChangedFileTreeEntry::Directory(entry) => {
-                                                            entry.render(ix, git_graph.clone(), cx)
-                                                        }
-                                                        ChangedFileTreeEntry::File(entry) => {
-                                                            entry.entry.render(
-                                                                ix,
-                                                                entry.depth,
-                                                                None,
-                                                                commit_sha.clone(),
-                                                                repository.clone(),
-                                                                workspace.clone(),
-                                                                cx,
-                                                            )
-                                                        }
-                                                    }
-                                                } else {
-                                                    let directory_label = (!flat_entries[ix]
-                                                        .dir_path
-                                                        .is_empty())
-                                                    .then(|| flat_entries[ix].dir_path.clone());
-                                                    flat_entries[ix].render(
-                                                        ix,
-                                                        0,
-                                                        directory_label,
-                                                        commit_sha.clone(),
-                                                        repository.clone(),
-                                                        workspace.clone(),
-                                                        cx,
-                                                    )
-                                                }
-                                            })
-                                            .collect()
-                                    },
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(self.render_commit_message(window, cx))
+            .child(Divider::horizontal())
+            .child(
+                v_flex().min_w_0().w_full().child(
+                    h_flex()
+                        .p_2()
+                        .pr_3()
+                        .pb_1()
+                        .gap_1()
+                        .w_full()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new(format!(
+                                        "{} Changed {}",
+                                        changed_files_count,
+                                        if changed_files_count == 1 {
+                                            "File"
+                                        } else {
+                                            "Files"
+                                        }
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                                 )
-                                .when(is_tree_view, |list| {
-                                    list.with_decoration(
-                                        ui::indent_guides(
-                                            px(TREE_INDENT),
-                                            IndentGuideColors::panel(cx),
-                                        )
-                                        .with_left_offset(
-                                            ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
-                                        )
-                                        .with_compute_indents_fn(
-                                            cx.entity(),
-                                            move |_, range, _window, _cx| {
-                                                range
-                                                    .map(|ix| match indent_tree_entries.get(ix) {
-                                                        Some(ChangedFileTreeEntry::Directory(
-                                                            entry,
-                                                        )) => entry.depth,
-                                                        Some(ChangedFileTreeEntry::File(entry)) => {
-                                                            entry.depth
-                                                        }
-                                                        None => 0,
-                                                    })
-                                                    .collect()
-                                            },
-                                        ),
-                                    )
-                                })
-                                .w_full()
-                                .with_sizing_behavior(ListSizingBehavior::Infer)
-                                .track_scroll(&self.changed_files_scroll_handle)
-                            }),
-                    )),
-                    )
-                    .vertical_scrollbar_for(&self.commit_details_scroll_handle, window, cx),
+                                .child(Divider::vertical())
+                                .child(view_toggle),
+                        )
+                        .child(DiffStat::new(
+                            "commit-diff-stat",
+                            total_lines_added,
+                            total_lines_removed,
+                        )),
+                ),
             )
             .into_any_element()
     }
@@ -7895,29 +7899,36 @@ mod tests {
         );
         cx.run_until_parked();
 
-        let (details_scroll_handle, changed_files_scroll_handle) =
-            git_graph.read_with(&*cx, |graph, _| {
-                (
-                    graph.commit_details_scroll_handle.clone(),
-                    graph.changed_files_scroll_handle.clone(),
-                )
-            });
-        let details_bounds = details_scroll_handle.bounds();
-        let changed_files_bounds = changed_files_scroll_handle.0.borrow().base_handle.bounds();
+        let (list_state, list_len) = git_graph.read_with(&*cx, |graph, _| {
+            (
+                graph.commit_details_list_state.clone(),
+                graph.commit_details_list_len.get(),
+            )
+        });
 
+        assert_eq!(
+            list_len, 2,
+            "the detail panel's list should hold the header plus one row per changed file"
+        );
         assert!(
-            details_scroll_handle.max_offset().y > px(0.),
+            ui::ScrollableHandle::max_offset(&list_state).y > px(0.),
             "a long commit message should make the whole detail panel scrollable"
         );
-        assert!(
-            changed_files_bounds.size.height > px(0.),
-            "the changed files list should be laid out at its full height inside the panel, \
-             so that scrolling the panel reveals it"
+
+        // Scrolling to the bottom of the panel has to reveal the changed file
+        // row, which lives in the same list as the header.
+        let viewport = ui::ScrollableHandle::viewport(&list_state);
+        ui::ScrollableHandle::set_offset(&list_state, point(px(0.), -viewport.size.height));
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
         );
+        cx.run_until_parked();
+
         assert!(
-            changed_files_bounds.top() >= details_bounds.top(),
-            "changed files {changed_files_bounds:?} should live inside the panel viewport \
-             {details_bounds:?}"
+            ui::ScrollableHandle::offset(&list_state).y < px(0.),
+            "the detail panel should stay scrolled away from the top"
         );
     }
 
