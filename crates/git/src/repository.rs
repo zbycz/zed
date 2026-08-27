@@ -699,6 +699,9 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    /// Commits reachable from any of the given refs, used by the git graph's
+    /// branch filter tabs.
+    Branches(Vec<SharedString>),
     Sha(Oid),
     Path(RepoPath),
 }
@@ -714,6 +717,10 @@ impl LogSource {
                 Cow::Borrowed("HEAD"),
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            LogSource::Branches(branches) => branches
+                .iter()
+                .map(|branch| Cow::Borrowed(branch.as_str()))
+                .collect(),
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
                 Cow::Borrowed("--follow"),

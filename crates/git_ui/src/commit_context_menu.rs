@@ -5,7 +5,7 @@ use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
-use workspace::Workspace;
+use workspace::{Workspace, notifications::DetachAndPromptErr};
 
 actions!(
     git_graph,
@@ -54,11 +54,40 @@ pub(crate) fn commit_context_menu(
         Some(ref_name) => format!("Ref {ref_name}"),
         None => format!("Commit {sha_short}"),
     };
+    let checkout_ref = checkout_target(&repository, ref_name.as_ref(), &commit.tag_names, cx);
 
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
             .context(focus_handle)
             .header(header)
+            .when_some(checkout_ref, |menu, checkout_ref| {
+                let repository = repository.clone();
+                menu.entry(
+                    format!("Check out {checkout_ref}"),
+                    None,
+                    move |window, cx| {
+                        let Some(repository) = repository.clone() else {
+                            return;
+                        };
+                        let checkout_ref = checkout_ref.to_string();
+                        window
+                            .spawn(cx, async move |cx| {
+                                repository
+                                    .update(cx, |repository, _| {
+                                        repository.change_branch(checkout_ref)
+                                    })?
+                                    .await??;
+                                anyhow::Ok(())
+                            })
+                            .detach_and_prompt_err(
+                                "Failed to check out ref",
+                                window,
+                                cx,
+                                |_, _, _| None,
+                            );
+                    },
+                )
+            })
             .entry("View Diff", Some(OpenCommitView.boxed_clone()), {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
@@ -177,6 +206,28 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+/// The branch a ref chip's context menu should offer to check out. Tags are
+/// skipped because checking one out would only detach `HEAD`, and so is the ref
+/// that is already checked out.
+fn checkout_target(
+    repository: &Option<WeakEntity<Repository>>,
+    ref_name: Option<&SharedString>,
+    tag_names: &[SharedString],
+    cx: &App,
+) -> Option<SharedString> {
+    let ref_name = ref_name?;
+    if tag_names.contains(ref_name) {
+        return None;
+    }
+    let repository = repository.as_ref()?.upgrade()?;
+    let is_checked_out = repository
+        .read(cx)
+        .branch
+        .as_ref()
+        .is_some_and(|branch| branch.name() == ref_name.as_ref());
+    (!is_checked_out).then(|| ref_name.clone())
 }
 
 fn git_task_context(
